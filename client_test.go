@@ -6,7 +6,7 @@ import (
 )
 
 func TestClient_EnqueueRequest_Pop(t *testing.T) {
-	client, err := NewClient("localhost", 6431)
+	client, err := NewClient("localhost", 6431, "guest", "guest")
 	if assert.NoError(t, err) {
 
 		id, err := client.EnqueueRequest([]byte("Hello"), HighPriority, []string{"foo"})

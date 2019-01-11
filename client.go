@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/golang/protobuf/proto"
 	"github.com/zlepper/go-brqueue/internal"
+	"log"
 	"net"
 	"sync"
 )
@@ -17,9 +18,10 @@ const (
 )
 
 var (
-	ErrInvalidPriority = errors.New("invalid priority")
-	ErrInvalidResponse = errors.New("invalid response")
-	ErrInvalidTask     = errors.New("invalid task")
+	ErrInvalidPriority    = errors.New("invalid priority")
+	ErrInvalidResponse    = errors.New("invalid response")
+	ErrInvalidTask        = errors.New("invalid task")
+	ErrInvalidCredentials = errors.New("invalid credentials")
 )
 
 // A raw wrapper around the TCP connection to the brqueue server.
@@ -27,7 +29,8 @@ var (
 // This client is safe to concurrent usage.
 type Client struct {
 	// The underlying TCP connection
-	pool *connectionPool
+	conn     net.Conn
+	connLock sync.Mutex
 	// Ref id generation
 	nextRefId      int32
 	nextRefIdMutex sync.Mutex
@@ -37,18 +40,26 @@ type Client struct {
 
 // Creates a new client and connects to the given hostname:port
 // An error is returned if the TCP connection cannot be created
-func NewClient(hostname string, port int) (*Client, error) {
-	pool, err := newConnectionPool(12, func() (net.Conn, error) {
-		return net.Dial("tcp", fmt.Sprintf("%s:%d", hostname, port))
-	})
+func NewClient(hostname string, port int, username, password string) (*Client, error) {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", hostname, port))
 	if err != nil {
 		return nil, err
 	}
 
 	c := &Client{
-		pool:		pool,
+		conn:      conn,
 		callbacks: make(map[int32]chan *internal.ResponseWrapper),
 	}
+
+	err = c.authenticate(username, password)
+	if err != nil {
+		closeErr := c.Close()
+		if closeErr != nil {
+			log.Println("Failed to close connection", closeErr)
+		}
+		return nil, err
+	}
+
 	return c, nil
 }
 
@@ -60,7 +71,32 @@ func (c *Client) Close() error {
 	}
 	c.callbacksMutex.Unlock()
 
-	return c.pool.close()
+	return c.conn.Close()
+}
+
+func (c *Client) authenticate(username, password string) error {
+	requestWrapper := &internal.RequestWrapper{
+		Message: &internal.RequestWrapper_Authenticate{
+			Authenticate: &internal.AuthenticateRequest{
+				Username: username,
+				Password: password,
+			},
+		},
+	}
+	responseWrapper, err := c.executeRequest(requestWrapper)
+	if err != nil {
+		return err
+	}
+
+	response := responseWrapper.GetAuthenticate()
+	if response == nil {
+		return ErrInvalidResponse
+	}
+	if response.Success {
+		return nil
+	} else {
+		return ErrInvalidCredentials
+	}
 }
 
 func (c *Client) getNextRefId() int32 {
@@ -71,7 +107,7 @@ func (c *Client) getNextRefId() int32 {
 }
 
 // Actually sends the message across the wire
-func (c *Client) sendMessage(message *internal.RequestWrapper, connection *connection) (refId int32, err error) {
+func (c *Client) sendMessage(message *internal.RequestWrapper) (refId int32, err error) {
 	refId = c.getNextRefId()
 	message.RefId = refId
 
@@ -82,7 +118,7 @@ func (c *Client) sendMessage(message *internal.RequestWrapper, connection *conne
 
 	size := intToByteArray(int32(len(data)))
 
-	_, err = connection.conn.Write(append(size, data...))
+	_, err = c.conn.Write(append(size, data...))
 	if err != nil {
 		return 0, err
 	}
@@ -91,19 +127,19 @@ func (c *Client) sendMessage(message *internal.RequestWrapper, connection *conne
 }
 
 // Reads the next message of the socket
-func (c *Client) readNextMessage(connection *connection) (*internal.ResponseWrapper, error) {
-	conn := connection.conn
-	connection.readLock.Lock()
-	defer connection.readLock.Unlock()
+func (c *Client) readNextMessage() (*internal.ResponseWrapper, error) {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
 	sizeBytes := make([]byte, 4)
-	_, err := conn.Read(sizeBytes)
+	_, err := c.conn.Read(sizeBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	data := make([]byte, byteArrayToInt(sizeBytes))
 
-	_, err = conn.Read(data)
+	_, err = c.conn.Read(data)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +154,7 @@ func (c *Client) readNextMessage(connection *connection) (*internal.ResponseWrap
 }
 
 // Waits for a response for the given refId
-func (c *Client) waitForResponse(refId int32, connection *connection) (*internal.ResponseWrapper, error) {
+func (c *Client) waitForResponse(refId int32) (*internal.ResponseWrapper, error) {
 	c.callbacksMutex.Lock()
 	res, ok := c.callbacks[refId]
 	if !ok {
@@ -132,7 +168,7 @@ func (c *Client) waitForResponse(refId int32, connection *connection) (*internal
 		c.callbacksMutex.Unlock()
 	}()
 
-	message, err := c.readNextMessage(connection)
+	message, err := c.readNextMessage()
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +192,6 @@ func (c *Client) waitForResponse(refId int32, connection *connection) (*internal
 	cha <- message
 	c.callbacksMutex.Unlock()
 
-
 	// Wait for a message to appear for us
 	message = <-res
 	errorMessage := message.GetError()
@@ -168,13 +203,12 @@ func (c *Client) waitForResponse(refId int32, connection *connection) (*internal
 
 // executes a request, and waits for a response
 func (c *Client) executeRequest(message *internal.RequestWrapper) (*internal.ResponseWrapper, error) {
-	connection := c.pool.get()
-	refId, err := c.sendMessage(message, connection)
+	refId, err := c.sendMessage(message)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.waitForResponse(refId, connection)
+	return c.waitForResponse(refId)
 }
 
 // Enqueues a new message
@@ -208,7 +242,7 @@ func (c *Client) EnqueueRequest(message []byte, priority Priority, requiredCapab
 
 	response := responseWrapper.GetEnqueue()
 	if response == nil {
-		return "", ErrInvalidPriority
+		return "", ErrInvalidResponse
 	}
 	return response.Id, nil
 }
